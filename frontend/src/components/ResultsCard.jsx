@@ -1,10 +1,10 @@
-import { EMOTION_META } from '../utils/analysisEngine';
+import { EMOTION_META } from '../utils/aiAnalysisEngine';
 import axios from 'axios';
 
 export default function ResultsCard({ record, onChecklistToggle }) {
   if (!record) return null;
 
-  const { emotion, brightnessScore, skinConditions, recommendations, date, _id } = record;
+  const { emotion, brightnessScore, skinConditions, recommendations, date, _id, age, gender, genderProbability } = record;
   const dom = EMOTION_META[emotion.dominant] || EMOTION_META.neutral;
 
   let totalTasks = 0, doneTasks = 0;
@@ -40,7 +40,7 @@ export default function ResultsCard({ record, onChecklistToggle }) {
           <div className="card-icon">🎭</div>
           <div>
             <h2 className="card-title">Facial Expression Analysis</h2>
-            <p className="card-subtitle">Detected emotional state</p>
+            <p className="card-subtitle">Real ML — face-api.js (TensorFlow.js) ⚡</p>
           </div>
         </div>
         <div className="emotion-display">
@@ -48,6 +48,12 @@ export default function ResultsCard({ record, onChecklistToggle }) {
             <div className="emotion-emoji">{dom.emoji}</div>
             <div className="emotion-name">{dom.label}</div>
             <div className="emotion-confidence">{emotion.scores[emotion.dominant] || 0}% confident</div>
+            {(age || gender) && (
+              <div className="age-gender-row">
+                {age    && <span className="age-gender-chip">🎂 ~{age} yrs</span>}
+                {gender && <span className="age-gender-chip">👤 {gender === 'male' ? '♂ Male' : '♀ Female'} ({genderProbability}%)</span>}
+              </div>
+            )}
           </div>
           <div className="emotion-bars">
             {Object.entries(emotion.scores).map(([key, p]) => {

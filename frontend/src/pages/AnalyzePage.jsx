@@ -1,36 +1,57 @@
 import { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
-import { analyzeImage, buildRecommendations } from '../utils/analysisEngine';
+import { loadModels, analyzeWithAI, buildRecommendations } from '../utils/aiAnalysisEngine';
 import ResultsCard from '../components/ResultsCard';
 
 export default function AnalyzePage({ user, onRecordSaved }) {
-  const [stream, setStream] = useState(null);
-  const [status, setStatus] = useState({ type: '', text: 'Camera not started' });
+  const [stream, setStream]       = useState(null);
+  const [status, setStatus]       = useState({ type: '', text: 'Camera not started' });
   const [analyzing, setAnalyzing] = useState(false);
-  const [step, setStep] = useState(0);
-  const [result, setResult] = useState(null);
-  
-  const videoRef = useRef(null);
+  const [step, setStep]           = useState(0);
+  const [result, setResult]       = useState(null);
+  const [modelReady, setModelReady] = useState(false);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [noFaceError, setNoFaceError]   = useState(false);
+
+  const videoRef         = useRef(null);
   const captureCanvasRef = useRef(null);
+
+  // Load AI models on mount
+  useEffect(() => {
+    (async () => {
+      setModelLoading(true);
+      setStatus({ type: 'analyzing', text: '🧠 Loading AI models...' });
+      try {
+        await loadModels();
+        setModelReady(true);
+        setStatus({ type: '', text: 'AI ready — start camera to begin' });
+      } catch (err) {
+        console.error('Model load error:', err);
+        setStatus({ type: 'error', text: 'AI model failed to load' });
+      } finally {
+        setModelLoading(false);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     return () => {
-      if (stream) {
-        stream.getTracks().forEach(t => t.stop());
-      }
+      if (stream) stream.getTracks().forEach(t => t.stop());
     };
   }, [stream]);
 
   const startCamera = async () => {
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360, facingMode: 'user' }, audio: false });
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 480, height: 360, facingMode: 'user' },
+        audio: false,
+      });
       setStream(mediaStream);
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-      }
+      if (videoRef.current) videoRef.current.srcObject = mediaStream;
       setStatus({ type: 'active', text: 'Camera active – ready to analyze' });
       setResult(null);
-    } catch (e) {
+      setNoFaceError(false);
+    } catch {
       setStatus({ type: 'error', text: 'Camera access denied' });
       alert('Please allow camera access to use FaceAura.');
     }
@@ -45,97 +66,79 @@ export default function AnalyzePage({ user, onRecordSaved }) {
     setStatus({ type: '', text: 'Camera stopped' });
   };
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const captureAndAnalyze = async () => {
     if (!stream || !videoRef.current) { alert('Please start camera first.'); return; }
-    
-    const video = videoRef.current;
+    if (!modelReady) { alert('AI models are still loading. Please wait a moment.'); return; }
+
+    const video  = videoRef.current;
     const canvas = captureCanvasRef.current;
-    canvas.width = video.videoWidth || 480;
-    canvas.height = video.videoHeight || 360;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     setAnalyzing(true);
-    setStatus({ type: 'analyzing', text: 'Analyzing...' });
+    setNoFaceError(false);
+    setStatus({ type: 'analyzing', text: 'AI analyzing your face...' });
 
-    for (let i = 1; i <= 4; i++) {
-      setStep(i);
-      await sleep(700);
-    }
-    
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const analysisRaw = analyzeImage(imageData, canvas.width, canvas.height);
-    const recommendations = buildRecommendations(analysisRaw.emotion.dominant, analysisRaw.brightnessScore, analysisRaw.skinConditions);
-    
-    if (user) {
-      const newRecordData = {
-        userId: user._id,
-        date: new Date().toISOString().split('T')[0],
-        timestamp: Date.now(),
-        brightnessScore: analysisRaw.brightnessScore,
-        emotion: analysisRaw.emotion,
-        skinConditions: analysisRaw.skinConditions,
+    // Animate steps
+    for (let i = 1; i <= 4; i++) { setStep(i); await sleep(650); }
+
+    try {
+      const aiResult = await analyzeWithAI(video, canvas);
+
+      if (!aiResult.faceDetected) {
+        setNoFaceError(true);
+        setStatus({ type: 'error', text: 'No face detected — try better lighting' });
+        setAnalyzing(false);
+        setStep(0);
+        return;
+      }
+
+      const recommendations = buildRecommendations(
+        aiResult.emotion.dominant,
+        aiResult.brightnessScore,
+        aiResult.skinConditions
+      );
+
+      const recordPayload = {
+        brightnessScore: aiResult.brightnessScore,
+        emotion:         aiResult.emotion,
+        skinConditions:  aiResult.skinConditions,
+        age:             aiResult.age,
+        gender:          aiResult.gender,
+        genderProbability: aiResult.genderProbability,
         recommendations: recommendations.map(cat => ({
           category: cat.title,
-          items: cat.items.map(i => ({ text: i, done: false }))
-        }))
+          items: cat.items.map(i => ({ text: i, done: false })),
+        })),
       };
 
-      try {
-        const res = await axios.post('/records', newRecordData);
-        onRecordSaved(res.data);
-        setResult(res.data);
-        setStatus({ type: 'active', text: 'Analysis complete!' });
-        
-        const toast = document.getElementById('toast');
-        if (toast) {
-          toast.textContent = 'Today\'s check-in saved! ✅';
-          toast.classList.add('show');
-          setTimeout(() => toast.classList.remove('show'), 3000);
+      if (user) {
+        try {
+          const res = await axios.post('/records', { ...recordPayload, userId: user._id, date: new Date().toISOString().split('T')[0], timestamp: Date.now() });
+          onRecordSaved(res.data);
+          setResult(res.data);
+          setStatus({ type: 'active', text: 'Analysis complete!' });
+          const toast = document.getElementById('toast');
+          if (toast) { toast.textContent = "Today's check-in saved! ✅"; toast.classList.add('show'); setTimeout(() => toast.classList.remove('show'), 3000); }
+        } catch (err) {
+          console.error(err);
+          setResult(recordPayload);
+          setStatus({ type: 'active', text: 'Analysis complete (save failed)' });
         }
-      } catch (err) {
-        console.error(err);
-        setStatus({ type: 'error', text: 'Failed to save analysis' });
-        setResult({
-          emotion: analysisRaw.emotion,
-          brightnessScore: analysisRaw.brightnessScore,
-          skinConditions: analysisRaw.skinConditions,
-          recommendations: recommendations.map(cat => ({
-            category: cat.title,
-            items: cat.items.map(i => ({ text: i, done: false }))
-          }))
-        });
+      } else {
+        setResult(recordPayload);
+        setStatus({ type: 'active', text: 'Analysis complete!' });
+        const toast = document.getElementById('toast');
+        if (toast) { toast.textContent = 'Log in to save this result to your journal! 🔒'; toast.classList.add('show'); setTimeout(() => toast.classList.remove('show'), 4000); }
       }
-    } else {
-      // Guest mode - don't save to DB
-      setResult({
-        emotion: analysisRaw.emotion,
-        brightnessScore: analysisRaw.brightnessScore,
-        skinConditions: analysisRaw.skinConditions,
-        recommendations: recommendations.map(cat => ({
-          category: cat.title,
-          items: cat.items.map(i => ({ text: i, done: false }))
-        }))
-      });
-      setStatus({ type: 'active', text: 'Analysis complete!' });
-      
-      const toast = document.getElementById('toast');
-      if (toast) {
-        toast.textContent = 'Log in to save this result to your journal! 🔒';
-        toast.classList.add('show');
-        setTimeout(() => toast.classList.remove('show'), 4000);
-      }
+    } catch (err) {
+      console.error('AI analysis error:', err);
+      setStatus({ type: 'error', text: 'Analysis failed. Please try again.' });
     }
 
     setAnalyzing(false);
     setStep(0);
-    
-    // smooth scroll to results
-    setTimeout(() => {
-      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-    }, 100);
+    setTimeout(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }), 100);
   };
 
   return (
@@ -143,10 +146,29 @@ export default function AnalyzePage({ user, onRecordSaved }) {
       <section className="camera-section glass-card">
         <div className="camera-header">
           <h1 className="section-title">📷 Live Face Analysis</h1>
-          <p className="section-subtitle">Allow camera access and click analyze to detect emotions & skin conditions</p>
-          {result && user && <div className="checkin-badge">✅ Today's check-in saved!</div>}
-          {result && !user && <div className="checkin-badge" style={{color:'var(--warning)', borderColor:'var(--warning)', background:'rgba(250, 204, 21, 0.1)'}}>🔒 Log in to save to your journal</div>}
+          <p className="section-subtitle">
+            {modelLoading
+              ? '🧠 Loading AI neural network models...'
+              : 'AI-powered emotion & skin analysis — real ML, no guesswork'}
+          </p>
+          {result && user  && <div className="checkin-badge">✅ Today's check-in saved!</div>}
+          {result && !user && <div className="checkin-badge" style={{ color:'var(--warning)', borderColor:'var(--warning)', background:'rgba(250,204,21,0.1)' }}>🔒 Log in to save to your journal</div>}
         </div>
+
+        {/* AI Model loading banner */}
+        {modelLoading && (
+          <div className="ai-model-banner">
+            <div className="ai-spinner-small"></div>
+            <span>Loading TensorFlow.js emotion detection model…</span>
+          </div>
+        )}
+
+        {!modelLoading && modelReady && (
+          <div className="ai-model-banner ai-model-ready">
+            <span>⚡</span>
+            <span>AI Model Ready — face-api.js (TensorFlow.js)</span>
+          </div>
+        )}
 
         <div className="camera-wrapper">
           <div className={`camera-frame ${stream ? 'active' : ''}`}>
@@ -163,10 +185,10 @@ export default function AnalyzePage({ user, onRecordSaved }) {
           </div>
 
           <div className="camera-controls">
-            <button className="btn btn-primary" onClick={startCamera} disabled={!!stream}>
+            <button className="btn btn-primary" onClick={startCamera} disabled={!!stream || modelLoading}>
               <span className="btn-icon">🎥</span><span>Start Camera</span>
             </button>
-            <button className="btn btn-secondary" onClick={captureAndAnalyze} disabled={!stream || analyzing}>
+            <button className="btn btn-secondary" onClick={captureAndAnalyze} disabled={!stream || analyzing || !modelReady}>
               <span className="btn-icon">🔍</span><span>Analyze Face</span>
             </button>
             <button className="btn btn-danger" onClick={stopCamera} disabled={!stream}>
@@ -178,6 +200,12 @@ export default function AnalyzePage({ user, onRecordSaved }) {
             <div className={`status-dot ${status.type}`}></div>
             <span>{status.text}</span>
           </div>
+
+          {noFaceError && (
+            <div className="no-face-warning">
+              😕 No face detected. Make sure your face is clearly visible, well-lit, and centered.
+            </div>
+          )}
         </div>
       </section>
 
@@ -185,12 +213,12 @@ export default function AnalyzePage({ user, onRecordSaved }) {
         <div className="analyzing-overlay">
           <div className="analyzing-content">
             <div className="ai-spinner"></div>
-            <p className="analyzing-text">AI analyzing your face...</p>
+            <p className="analyzing-text">AI analyzing your face…</p>
             <div className="analyzing-steps">
-              <div className={`step ${step >= 1 ? (step > 1 ? 'done' : 'active') : ''}`}>🎭 Detecting expressions...</div>
-              <div className={`step ${step >= 2 ? (step > 2 ? 'done' : 'active') : ''}`}>✨ Analyzing skin brightness...</div>
-              <div className={`step ${step >= 3 ? (step > 3 ? 'done' : 'active') : ''}`}>🔬 Checking skin conditions...</div>
-              <div className={`step ${step >= 4 ? (step > 4 ? 'done' : 'active') : ''}`}>💾 Saving to your journal...</div>
+              <div className={`step ${step >= 1 ? (step > 1 ? 'done' : 'active') : ''}`}>🎭 Detecting face landmarks…</div>
+              <div className={`step ${step >= 2 ? (step > 2 ? 'done' : 'active') : ''}`}>🧠 Running emotion neural network…</div>
+              <div className={`step ${step >= 3 ? (step > 3 ? 'done' : 'active') : ''}`}>✨ Analyzing skin brightness…</div>
+              <div className={`step ${step >= 4 ? (step > 4 ? 'done' : 'active') : ''}`}>💾 Building recommendations…</div>
             </div>
           </div>
         </div>
